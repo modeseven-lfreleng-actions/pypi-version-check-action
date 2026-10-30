@@ -41,13 +41,162 @@ runs:
   using: "composite"
   steps:
     - name: "Check pip installed/available"
+      id: pip
       shell: bash
+      env:
+        ACTION_PATH: "${{ github.action_path }}"
+        RUN_PIP: "${{ github.action_path }}/scripts/run_pip.py"
+        PYTHONPATH_FILTER: >-
+          ${{ github.action_path }}/scripts/trusted_pythonpath.py
+        # Where pip may fall back to a user install when the caller's
+        # user site is in the workspace; shared by both steps.
+        FALLBACK_USER_BASE: >-
+          ${{ runner.temp }}/pypi-version-check-action/user-base
       run: |
         # Check pip installed/available
+        # On macOS, PYTHONEXECUTABLE and __PYVENV_LAUNCHER__ tell Python
+        # where it was started from, and it reads them even under -I: a
+        # pyvenv.cfg beside the place they name makes that a virtual
+        # environment, whose home, standard library and site-packages
+        # could then be in the workspace. A pip query needs neither, so
+        # both are dropped before any Python starts.
+        unset PYTHONEXECUTABLE __PYVENV_LAUNCHER__
+        # The working directory is the caller's workspace. 'python3 -m'
+        # would put it first on sys.path, so a pip/ there would run in
+        # place of the installed pip; run_pip.py starts pip without it.
+        # The working directory itself is kept, so relative paths in
+        # pip's own settings still resolve.
+        #
+        # Choose python3 from PATH, skipping relative entries and any
+        # that reach the workspace: an interpreter there (a .venv/bin in
+        # the checkout) would run its site-packages' .pth and
+        # sitecustomize files before pip starts. Every directory on the
+        # way counts, as written (Python looks for pyvenv.cfg beside
+        # and above the path it was started by, before resolving links)
+        # and through each symlink to the file. Links are read with the
+        # system's own readlink (command -p searches only the standard
+        # system directories, not PATH), and a path that cannot be
+        # resolved counts as reaching the workspace. The PATH entries
+        # that pass are the PATH both steps use from then on.
+        real_dir() { (cd -P "$1" 2> /dev/null && pwd -P); }
+        roots=()
+        for root in "$PWD" "${GITHUB_WORKSPACE:-}"; do
+          real="$(real_dir "$root")" && [ -n "$real" ] && roots+=("$real")
+        done
+        dirs_reach_workspace() {
+          local rest="${1%/*}" prefix="" part real root
+          while [ -n "$rest" ]; do
+            part="${rest%%/*}"
+            case "$rest" in */*) rest="${rest#*/}" ;; *) rest="" ;; esac
+            [ -n "$part" ] || continue
+            prefix="$prefix/$part"
+            real="$(real_dir "$prefix")" || return 0
+            for root in "${roots[@]}"; do
+              case "$real/" in "$root"/*) return 0 ;; esac
+            done
+          done
+          return 1
+        }
+        reaches_workspace() {
+          local path="$1" dir target hops=0
+          while :; do
+            dirs_reach_workspace "$path" && return 0
+            dir="$(real_dir "${path%/*}/")" || return 0
+            path="$dir/${path##*/}"
+            [ -L "$path" ] || return 1
+            hops=$((hops + 1))
+            [ "$hops" -le 40 ] || return 0
+            target="$(command -p readlink "$path")" || return 0
+            case "$target" in
+              /*) path="$target" ;;
+              *) path="$dir/$target" ;;
+            esac
+          done
+        }
+        trusted_path=""
+        IFS=: read -r -a path_dirs <<< "$PATH"
+        for dir in "${path_dirs[@]}"; do
+          case "$dir" in /*) ;; *) continue ;; esac
+          dirs_reach_workspace "$dir/" && continue
+          trusted_path="${trusted_path:+$trusted_path:}$dir"
+        done
+        # A shim may choose the interpreter by the working directory
+        # (pyenv's .python-version, for one) or by PATH, so each
+        # candidate is asked where it runs from, in the action's own
+        # directory and with the trusted PATH, and that path, checked
+        # in turn, is the one both steps run.
+        python=""
+        IFS=: read -r -a path_dirs <<< "$trusted_path"
+        for dir in "${path_dirs[@]}"; do
+          candidate="$dir/python3"
+          [ -f "$candidate" ] && [ -x "$candidate" ] || continue
+          reaches_workspace "$candidate" && continue
+          resolved="$(cd "$ACTION_PATH" && PATH="$trusted_path" \
+            "$candidate" -I -S -c 'import sys; print(sys.executable)')" ||
+            continue
+          resolved="${resolved##*$'\n'}"
+          case "$resolved" in /*) ;; *) continue ;; esac
+          reaches_workspace "$resolved" && continue
+          python="$resolved"
+          break
+        done
+        if [ -z "$python" ]; then
+          echo "No python3 found on PATH outside the workspace ❌"; exit 1
+        fi
+        export PATH="$trusted_path"
+        echo "python=$python" >> "$GITHUB_OUTPUT"
+        echo "path=$trusted_path" >> "$GITHUB_OUTPUT"
+        # The ensurepip call below changes directory, so a relative HOME
+        # or PYTHONUSERBASE (where pip may fall back to install) is made
+        # absolute first, keeping its meaning.
+        case "${HOME:-/}" in
+          /*) ;;
+          *) export HOME="$PWD/$HOME" ;;
+        esac
+        case "${PYTHONUSERBASE:-/}" in
+          /*) ;;
+          *) export PYTHONUSERBASE="$PWD/$PYTHONUSERBASE" ;;
+        esac
+        # PYTHONPATH is not passed to pip's interpreter: entries there
+        # come before the standard library and are searched for a
+        # sitecustomize module at start-up, so one linking into the
+        # checkout would run. The entries that are absolute and neither
+        # in nor above the workspace, such as a pip installed with
+        # --target, go to run_pip.py in ACTION_PYTHONPATH instead, which
+        # puts them after the standard library. A user site inside or
+        # above the workspace, whose .pth files Python runs at start-up,
+        # moves to FALLBACK_USER_BASE, which both steps share, so pip can
+        # still fall back to a user install. PYTHONHOME or
+        # PYTHONPYCACHEPREFIX reaching the workspace, through any of the
+        # standard-library directories under the home, would load the
+        # standard library or its bytecode from there, so they are
+        # unset.
+        # The filter runs with -I -S: no workspace module and no .pth
+        # file can change what it prints. Assigned before eval, so a
+        # failure stops the step.
+        settings="$("$python" -I -S "$PYTHONPATH_FILTER")"
+        eval "$settings"
+        # With those settings, Python finds its prefix as it will for
+        # pip; -S stops any .pth file running while the filter checks
+        # that none of the interpreter's own site-packages directories
+        # (a venv's linked into the checkout, say), and no path a .pth
+        # file there adds (an editable install of the checkout), lies in
+        # or above the workspace.
+        if ! "$python" -S "$PYTHONPATH_FILTER" --check-site; then
+          echo "python3 loads site-packages from the workspace ❌"; exit 1
+        fi
         # Probe pip through the interpreter the next step runs it with;
         # ensurepip does not guarantee a bare "pip" command on PATH
-        if ! python3 -m pip --version > /dev/null 2>&1; then
-          if ! python3 -m ensurepip --upgrade > /dev/null; then
+        if ! "$python" "$RUN_PIP" --version > /dev/null 2>&1; then
+          # ensurepip runs pip in a second interpreter started with -c,
+          # which puts its working directory first on sys.path, so run
+          # it from the action's own directory. -I would also do that,
+          # but it hides the user site from that pip, which then cannot
+          # fall back to a user install when site-packages is read-only.
+          # ensurepip ignores pip's settings, so the move changes nothing
+          # else.
+          if ! (cd "$ACTION_PATH" &&
+            "$python" -m ensurepip --upgrade > /dev/null); then
             echo "Unable to find/install pip command ❌"
             echo "Check instance type and OS environment"; exit 1
           fi
@@ -58,6 +207,13 @@ runs:
       id: check
       shell: bash
       env:
+        PYTHON: "${{ steps.pip.outputs.python }}"
+        TRUSTED_PATH: "${{ steps.pip.outputs.path }}"
+        RUN_PIP: "${{ github.action_path }}/scripts/run_pip.py"
+        PYTHONPATH_FILTER: >-
+          ${{ github.action_path }}/scripts/trusted_pythonpath.py
+        FALLBACK_USER_BASE: >-
+          ${{ runner.temp }}/pypi-version-check-action/user-base
         INPUT_INDEX_URL: "${{ inputs.INDEX_URL }}"
         INPUT_PACKAGE_NAME: "${{ inputs.PACKAGE_NAME }}"
         INPUT_PACKAGE_VERSION: "${{ inputs.PACKAGE_VERSION }}"
@@ -65,13 +221,18 @@ runs:
         INPUT_EXIT_ON_FAIL: "${{ inputs.EXIT_ON_FAIL }}"
       run: |
         # Check Python package index
+        # As in the step above
+        unset PYTHONEXECUTABLE __PYVENV_LAUNCHER__
+        export PATH="$TRUSTED_PATH"
+        # Text tools come from the system's own directories (command -p),
+        # not PATH, which may lead into the workspace.
         INDEX_URL="$INPUT_INDEX_URL"
         PACKAGE_NAME="$INPUT_PACKAGE_NAME"
         PACKAGE_VERSION="$INPUT_PACKAGE_VERSION"
         PRE_RELEASE=$(printf '%s' "$INPUT_PRE_RELEASE" |\
-        tr '[:upper:]' '[:lower:]')
+        command -p tr '[:upper:]' '[:lower:]')
         EXIT_ON_FAIL=$(printf '%s' "$INPUT_EXIT_ON_FAIL" |\
-          tr '[:upper:]' '[:lower:]')
+          command -p tr '[:upper:]' '[:lower:]')
 
         if [[ "$PACKAGE_VERSION" == v* ]]; then
           echo "Stripping non-numeric leading character from version string ⚠️"
@@ -85,13 +246,22 @@ runs:
         fi
 
         # Note: pip index is experimental and NOT fully supported
+        # pip runs as in the step above: with the interpreter and PATH
+        # it chose, without the working directory or PYTHONPATH on
+        # sys.path at start-up, no user site in the workspace, and no
+        # site-packages directory or .pth path in it
+        settings="$("$PYTHON" -I -S "$PYTHONPATH_FILTER")"
+        eval "$settings"
+        if ! "$PYTHON" -S "$PYTHONPATH_FILTER" --check-site; then
+          echo "python3 loads site-packages from the workspace ❌"; exit 1
+        fi
         if [ "f$PRE_RELEASE" = "ftrue" ]; then
           # Additional flag to report development builds
-          OUTPUT=$(python3 -m pip index --disable-pip-version-check \
+          OUTPUT=$("$PYTHON" "$RUN_PIP" index --disable-pip-version-check \
               "--index-url=$INDEX_URL" versions --pre \
               "$PACKAGE_NAME" || true)
         else
-          OUTPUT=$(python3 -m pip index --disable-pip-version-check \
+          OUTPUT=$("$PYTHON" "$RUN_PIP" index --disable-pip-version-check \
             "--index-url=$INDEX_URL" versions \
             "$PACKAGE_NAME" || true)
         fi
@@ -104,7 +274,8 @@ runs:
           QUERY_ERROR="true"
         fi
 
-        if (echo "$OUTPUT" | grep "Available versions" >/dev/null 2>&1); then
+        if (echo "$OUTPUT" |
+          command -p grep "Available versions" >/dev/null 2>&1); then
            PACKAGE_MATCH="true"
            echo "Package $PACKAGE_NAME found in index ✅"
         fi
@@ -112,8 +283,9 @@ runs:
         VERSION_MATCH="untested"
 
         if [ -n "$PACKAGE_VERSION" ]; then
-          VERSIONS=$(echo "$OUTPUT" | grep 'Available versions' \
-            | sed "s/,//g" | sed "s/Available versions://")
+          VERSIONS=$(echo "$OUTPUT" | command -p grep 'Available versions' \
+            | command -p sed "s/,//g" \
+            | command -p sed "s/Available versions://")
 
            # Assume no match, then iterate over all reported versions
            VERSION_MATCH="false"

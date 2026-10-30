@@ -63,7 +63,9 @@ index uses purely numerical versioning.
 This action uses the "pip index" command, which is an experimental command.
 It may get removed/changed in a future release without prior warning.
 
-The action runs pip as "python3 -m pip", so it needs "python3" on the PATH.
+The action runs pip with the first "python3" on the PATH that lies outside
+the caller's workspace, and stops with an error when it finds none, or when
+that interpreter's site-packages are in the workspace.
 When that interpreter lacks pip, the action installs it with "ensurepip",
 and fails with an error if that is not possible.
 
